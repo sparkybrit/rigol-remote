@@ -15,7 +15,8 @@ NO_ERROR = '0,"No error"'
 class FakeRigol:
     """A PacketDevice that behaves like the DS1054Z's USB as observed through the kernel driver:
     64-byte packets, a 500-byte first transfer for long replies, replies padded to even length,
-    and a zero-length packet after any transfer that exactly fills its last packet.
+    a zero-length packet after any transfer that exactly fills its last packet, and incoming
+    transfers longer than one packet silently ignored.
 
     Its SCPI side is a lookup table: `replies` answers exact queries; `state` holds settings that
     can be set ("HEADER value") and read back ("HEADER?"), optionally snapped by `snap` (a state
@@ -31,6 +32,7 @@ class FakeRigol:
         self.blocks: dict[str, bytes] = {}
         self.commands: list[str] = []
         self.packets: deque[bytes] = deque()
+        self._message = b""  # DEV_DEP_MSG_OUT parts received so far
         self._pending = b""
         self._first_transfer = True
         self.tag_offset = 0  # set non-zero to answer with the wrong bTag
@@ -39,10 +41,14 @@ class FakeRigol:
         msg_id, tag, inverse, size, attributes = struct.unpack_from("<BBBxIB", data)
         assert inverse == ~tag & 0xFF and 1 <= tag <= 255
         if msg_id == 1:  # DEV_DEP_MSG_OUT
-            assert attributes & 1 and len(data) % 4 == 0
-            message = data[12 : 12 + size]
-            assert message.endswith(b"\n")
-            self._execute(message[:-1])
+            assert len(data) % 4 == 0
+            if len(data) > 64:
+                return  # like the real scope: a transfer longer than one packet is silently ignored
+            self._message += data[12 : 12 + size]
+            if attributes & 1:  # EOM: the message is complete
+                message, self._message = self._message, b""
+                assert message.endswith(b"\n")
+                self._execute(message[:-1])
         elif msg_id == 2:  # REQUEST_DEV_DEP_MSG_IN
             self._send_transfer(tag)
         else:

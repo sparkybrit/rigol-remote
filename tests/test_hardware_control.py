@@ -97,6 +97,16 @@ def test_run_control(original):
         scope.run()
 
 
+def test_restore_setup_really_restores(original):
+    # Restoring an unchanged setup proves nothing (that hid a bug), so change something first.
+    # CH2 is off, so the change is invisible.
+    with connect() as scope:
+        saved = scope.save_setup()
+        current = scope.settings()["channels"]["CHAN2"]["scale_v_per_div"]
+        scope.configure_channel(2, scale_v_per_div=0.5 if current != 0.5 else 0.2)
+        assert scope.restore_setup(saved)["channels"]["CHAN2"]["scale_v_per_div"] == current
+
+
 def test_raw_write():
     with connect() as scope:
         scope.write(":CHANnel2:VERNier ON")

@@ -1,9 +1,10 @@
 """USBTMC to a Rigol DS1000Z through the Linux kernel driver's raw ioctls.
 
 Plain read() on /dev/usbtmcN truncates this scope's replies to 52 bytes: its bulk endpoints declare
-wMaxPacketSize 64 while running at high speed, and the driver hands back only the first packet. So
-we do the USBTMC framing ourselves with USBTMC_IOCTL_WRITE / USBTMC_IOCTL_READ, one packet at a
-time. CLAUDE.md ("USB transport") records the observed device behaviour this implements.
+wMaxPacketSize 64 while running at high speed, and the driver hands back only the first packet.
+Writes have the mirror-image problem: a transfer longer than one packet is silently ignored. So we
+do the USBTMC framing ourselves with USBTMC_IOCTL_WRITE / USBTMC_IOCTL_READ, one packet at a time
+in both directions. CLAUDE.md ("USB transport") records the observed device behaviour.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ DEV_DEP_MSG_OUT = 1
 REQUEST_DEV_DEP_MSG_IN = 2
 EOM = 0x01
 MAX_TRANSFER = 1 << 20  # TransferSize offered in each REQUEST_DEV_DEP_MSG_IN
+MAX_OUT_PAYLOAD = 48  # per DEV_DEP_MSG_OUT transfer: header + 48 = 60 bytes, one packet
 PACKET_TIMEOUT = 2.0  # seconds to wait for any packet after a reply has started
 MIN_TIMEOUT = 0.1  # the driver rejects timeouts under 100 ms
 
@@ -120,9 +122,14 @@ class UsbtmcTransport:
         self._send(command.encode("ascii") + b" #9%09d" % len(data) + data + b"\n")
 
     def _send(self, payload: bytes) -> None:
-        # One DEV_DEP_MSG_OUT transfer, even for multi-KB setups: verified with :SYSTem:SETup.
-        frame = self._header(DEV_DEP_MSG_OUT, self._next_tag(), len(payload), EOM) + payload
-        self.device.write(frame + b"\0" * (-len(frame) % 4))
+        # The scope silently ignores a transfer that spans several packets (a 2 KB :SYSTem:SETup
+        # sent whole was dropped, with no error), so split the message into single-packet
+        # DEV_DEP_MSG_OUT transfers, with EOM only on the last.
+        for start in range(0, len(payload), MAX_OUT_PAYLOAD):
+            part = payload[start : start + MAX_OUT_PAYLOAD]
+            last = start + MAX_OUT_PAYLOAD >= len(payload)
+            frame = self._header(DEV_DEP_MSG_OUT, self._next_tag(), len(part), EOM if last else 0) + part
+            self.device.write(frame + b"\0" * (-len(frame) % 4))
 
     def read(self, timeout: float = PACKET_TIMEOUT) -> bytes:
         """Read one complete reply. `timeout` covers the wait for its first packet."""

@@ -29,6 +29,19 @@ def test_block_write_frames_data_as_ieee_block():
     assert frame[12 : 12 + len(payload)] == payload and len(frame) % 4 == 0
 
 
+def test_long_messages_go_out_as_single_packet_transfers():
+    # The scope ignores multi-packet transfers, so a 2 KB setup has to be split, EOM on the last.
+    fake = FakeRigol()
+    frames = []
+    real_write = fake.write
+    fake.write = lambda data: (frames.append(data), real_write(data))
+    setup = bytes(range(256)) * 8
+    UsbtmcTransport(fake).write_block(":SYSTem:SETup", setup)
+    assert fake.blocks[":SYSTem:SETup"] == setup
+    assert all(len(f) <= 64 for f in frames)
+    assert [f[8] & 1 for f in frames] == [0] * (len(frames) - 1) + [1]
+
+
 def test_reply_longer_than_one_packet_is_not_truncated():
     # Plain read() on the kernel driver stops at 52 bytes here ("...00.04.04.S").
     t = UsbtmcTransport(FakeRigol({"*IDN?": IDN}))

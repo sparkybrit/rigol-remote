@@ -7,8 +7,9 @@ user scope so every Claude Code session gets its tools.
 **Status (2026-09-13):** milestones 1 and 2 are done. Reading covers identify, screenshot, settings,
 measure, waveform, SCPI query and setup save. Control covers channel, timebase, trigger and
 acquisition changes, run/stop/single/force, setup restore, reset, autoscale, clearing the
-measurement bar and raw SCPI writes. Everything goes over USB, and the unit tests, read-only
-hardware tests and restoring control-hardware tests all pass. Items marked ✅ were verified on this
+measurement bar and raw SCPI writes. Everything goes over USB. The unit tests, read-only hardware
+tests and restoring control-hardware tests all pass, including reset and autoscale followed by a
+full restore. Items marked ✅ were verified on this
 unit. Everything else comes from the DS1000Z Programming Guide or community experience. Update this
 file when you confirm or correct something against the real scope.
 
@@ -47,8 +48,12 @@ What works: `usbtmc.py` does the USBTMC framing itself through the driver's raw 
 udev rule. `tests/conftest.py::FakeRigol` reproduces the observed behaviour below. Keep it faithful
 when you learn more.
 
-- **Send:** `01, bTag, ~bTag, 00, u32 len, 01 (EOM), 00 00 00`, then the payload, zero-padded to a
-  multiple of 4. `bTag` cycles 1–255. ✅ One transfer works even for a 2 KB binary setup block.
+- **Send:** `01, bTag, ~bTag, 00, u32 len, attr, 00 00 00`, then the payload, zero-padded to a
+  multiple of 4. `bTag` cycles 1–255.
+  - ✅ **A transfer longer than one packet is silently ignored:** no error, and `*OPC?` still
+    answers. A 2 KB `:SYSTem:SETup` sent as one transfer did nothing.
+  - So `_send()` splits every message into transfers of ≤48 payload bytes (60-byte frames), with
+    EOM (`attr` bit 0) only on the last. `FakeRigol` drops oversized transfers the same way.
 - **Receive, one transfer per request:**
   1. Send `02, bTag, ~bTag, 00, u32 max_len, 00 00 00 00`.
   2. Read **one 64-byte packet per ioctl** until you have `12 + TransferSize` bytes.
@@ -114,8 +119,9 @@ tests/           # unit tests on FakeRigol; test_hardware.py (read-only) and
   `~/snap/code/<rev>/…`, which vanishes on update.
 
 **Roadmap:**
-1. Verify `reset`/`autoscale`/`clear_measurements` on hardware. This needs the user's OK, because
-   they wipe the setup or the measurement bar.
+1. Find out what raises the "confirm lock?" prompt (see *Behaviour verified*). Also verify
+   `clear_measurements` on hardware. Both need the user's OK, because they touch the front panel or
+   the measurement bar.
 2. RAW (memory-depth) waveforms.
 3. Waveform plots.
 4. `TcpTransport` once a network cable is connected.
@@ -173,9 +179,19 @@ After changing the MCP server, sessions pick up the new code only when their ser
 - ✅ **Single and run:** `:SINGle` sets the sweep to `SING`, and a following `:RUN` restores the
   previous sweep mode.
 - ✅ **Setup snapshot:** `:SYSTem:SETup?` is a 2081-byte binary blob starting `VZ8\0DS1054Z`.
-  Writing it back with `:SYSTem:SETup #9…` (one 2 KB transfer) takes ~6 s and restores every
-  setting. The blob isn't byte-identical afterwards (it holds transient state), so compare
-  `settings()` instead.
+  - Writing it back with `:SYSTem:SETup #9…`, split into single-packet transfers, takes ~6 s.
+  - It restores every `settings()` value *and* the measurement bar. This was verified after
+    `*RST` + `:AUToscale` (2026-09-13).
+  - The screen keeps redrawing for a few seconds after `*OPC?` returns.
+  - The blob isn't byte-identical afterwards (it holds transient state), so compare `settings()`.
+  - **Test restores by changing something first:** restoring an unchanged setup proves nothing,
+    and that hid the oversized-transfer bug.
+- ✅ **`*RST`** clears the measurement bar and channel labels. Labels have no SCPI on this firmware
+  (`:CHANnel1:LABel…` is an undefined header). It's unknown whether the setup blob restores them.
+- ⚠️ **Open issue:** after a full hardware_write run that included reset and a restore, the scope
+  showed "Can't be unlocked by key, confirm lock?" (OK/Cancel). `:SYSTem:LOCKed?` was `0`, so the
+  keys weren't locked. Its cause is unconfirmed; the restore is the prime suspect. Cancel dismisses
+  it. **OK would lock the front panel.**
 - ✅ **Waveforms:** `:WAVeform:SOURce/MODE NORMal/FORMat BYTE`, then `:PREamble?`
   (`format,type,points,count,xinc,xorigin,xref,yinc,yorigin,yref`) and `:DATA?` (1200 points).
   `V = (raw − yorigin − yref) × yinc` matched the scope's own VPP to within 2%.
@@ -200,8 +216,8 @@ both the query and the set form unless noted.
 | Acquire | `:ACQuire:TYPE` ✅, `:AVERages` ✅, `:MDEPth` ✅, `:SRATe?` ✅ |
 | Measure | `:MEASure:ITEM? <item>,CHAN<n>` ✅ (VPP, VAVG, VRMS, FREQ tried; the full list is in `scope.py`); `:MEASure:CLEar ALL\|ITEM<n>` (untested) |
 | Waveform | `:WAVeform:SOURce` ✅, `:MODE` ✅, `:FORMat` ✅, `:PREamble?` ✅, `:DATA?` ✅, `:STARt`, `:STOP` |
-| Screen / setup | `:DISPlay:DATA? ON,OFF,PNG` ✅, `:SYSTem:SETup?` ✅, `:SYSTem:SETup <block>` ✅ |
-| **Destructive** | `*RST`, `:AUToscale` (untested: they wipe the user's setup), `:CLEar` |
+| Screen / setup | `:DISPlay:DATA? ON,OFF,PNG` ✅, `:SYSTem:SETup?` ✅, `:SYSTem:SETup <block>` ✅ (split transfers), `:SYSTem:LOCKed?` ✅ |
+| **Destructive** | `*RST` ✅, `:AUToscale` ✅ (both wipe the user's setup; restore_setup undoes them), `:CLEar` |
 
 The authoritative source is the *MSO1000Z/DS1000Z Programming Guide*. Save the PDF under `docs/` and
 Read it with the `pages` parameter.
