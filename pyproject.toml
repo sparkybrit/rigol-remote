@@ -1,0 +1,30 @@
+[project]
+name = "rigol-remote"
+version = "0.1.0"
+description = "Control a Rigol DS1054Z oscilloscope over USB from Claude Code (CLI + MCP server)"
+readme = "README.md"
+authors = [
+    { name = "Graeme Harker", email = "graeme.harker@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "mcp>=2.2.0",
+]
+
+[project.scripts]
+rigol = "rigol_remote.cli:main"
+rigol-mcp = "rigol_remote.mcp_server:main"
+
+[build-system]
+requires = ["uv_build>=0.12.13,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-m 'not hardware'"
+markers = ["hardware: talks to the real scope (run with: uv run pytest -m hardware)"]
