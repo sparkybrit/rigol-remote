@@ -113,7 +113,14 @@ class UsbtmcTransport:
         return struct.pack("<BBBxIB3x", msg_id, tag, ~tag & 0xFF, size, attributes)
 
     def write(self, command: str) -> None:
-        payload = command.encode("ascii") + b"\n"
+        self._send(command.encode("ascii") + b"\n")
+
+    def write_block(self, command: str, data: bytes) -> None:
+        """Send `command` with `data` as an IEEE 488.2 definite-length block argument."""
+        self._send(command.encode("ascii") + b" #9%09d" % len(data) + data + b"\n")
+
+    def _send(self, payload: bytes) -> None:
+        # One DEV_DEP_MSG_OUT transfer, even for multi-KB setups: verified with :SYSTem:SETup.
         frame = self._header(DEV_DEP_MSG_OUT, self._next_tag(), len(payload), EOM) + payload
         self.device.write(frame + b"\0" * (-len(frame) % 4))
 

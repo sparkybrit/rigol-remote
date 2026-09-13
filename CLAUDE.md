@@ -4,11 +4,13 @@ Drive a Rigol DS1054Z oscilloscope from Claude Code. This project is the shared 
 on this host use: a Python package with a `rigol` CLI and an MCP server (`rigol-mcp`), registered at
 user scope so every Claude Code session gets its tools.
 
-**Status (2026-09-13):** milestone 1 done. It has read-only tools (identify, screenshot, settings,
-measure, waveform, SCPI query) over USB, the MCP server is registered, and both the unit tests and
-the hardware tests pass. Items marked ✅ were verified on this unit. Everything else comes from the
-DS1000Z Programming Guide or community experience. When you confirm or correct something against
-the real scope, update this file.
+**Status (2026-09-13):** milestones 1 and 2 are done. Reading covers identify, screenshot, settings,
+measure, waveform, SCPI query and setup save. Control covers channel, timebase, trigger and
+acquisition changes, run/stop/single/force, setup restore, reset, autoscale, clearing the
+measurement bar and raw SCPI writes. Everything goes over USB, and the unit tests, read-only
+hardware tests and restoring control-hardware tests all pass. Items marked ✅ were verified on this
+unit. Everything else comes from the DS1000Z Programming Guide or community experience. Update this
+file when you confirm or correct something against the real scope.
 
 ## The instrument
 
@@ -45,8 +47,8 @@ What works: `usbtmc.py` does the USBTMC framing itself through the driver's raw 
 udev rule. `tests/conftest.py::FakeRigol` reproduces the observed behaviour below. Keep it faithful
 when you learn more.
 
-- **Send:** `01, bTag, ~bTag, 00, u32 len, 01 (EOM), 00 00 00`, then the command plus `\n`, zero-padded
-  to a multiple of 4. `bTag` cycles 1–255.
+- **Send:** `01, bTag, ~bTag, 00, u32 len, 01 (EOM), 00 00 00`, then the payload, zero-padded to a
+  multiple of 4. `bTag` cycles 1–255. ✅ One transfer works even for a 2 KB binary setup block.
 - **Receive, one transfer per request:**
   1. Send `02, bTag, ~bTag, 00, u32 max_len, 00 00 00 00`.
   2. Read **one 64-byte packet per ioctl** until you have `12 + TransferSize` bytes.
@@ -62,7 +64,8 @@ when you learn more.
   that was lost. If that fails, replug the cable. `connect()` drains on open and after any error
   instead.
 - The driver rejects timeouts under 100 ms.
-- Measured: `*IDN?` ~1 ms; NORMal waveform (1212 B) 2–3 ms; PNG screenshot (32–58 KB) ~1 s.
+- Measured: `*IDN?` ~1 ms; NORMal waveform (1212 B) 2–3 ms; PNG screenshot (32–58 KB) ~1 s; setup
+  restore ~6 s.
 
 ## Architecture
 
@@ -70,11 +73,12 @@ when you learn more.
 src/rigol_remote/
   usbtmc.py      # KernelUsbtmc (raw ioctls, one packet at a time) + UsbtmcTransport (framing, quirks)
   connection.py  # find_usbtmc() via sysfs, flock-based exclusive lock, connect() context manager
-  scope.py       # DS1054Z: identify, screenshot_png, settings, measure, waveform, query (read-only)
-  captures.py    # save_capture(): ~/.local/share/rigol-remote/captures, exclusive-create filenames
-  cli.py         # `rigol` console script
+  scope.py       # DS1054Z: reading, configure_*, run control, setup save/restore, reset/autoscale, write
+  captures.py    # save_capture(), backup_setup(), read_setup(): ~/.local/share/rigol-remote/captures
+  cli.py         # `rigol` console script (numbers take SI suffixes: 500m, 20ns)
   mcp_server.py  # `rigol-mcp`: MCPServer (mcp 2.x) over stdio; INSTRUCTIONS carry the rules for users
-tests/           # unit tests on FakeRigol; test_hardware.py (marker `hardware`, read-only) on the real scope
+tests/           # unit tests on FakeRigol; test_hardware.py (read-only) and
+                 # test_hardware_control.py (changes settings, then restores the saved setup)
 ```
 
 - **Other sessions use the MCP server.** It's registered with
@@ -84,22 +88,34 @@ tests/           # unit tests on FakeRigol; test_hardware.py (marker `hardware`,
 - **Every session runs its own server process**, so each operation is `with connect() as scope:`.
   That opens the device, takes an exclusive `flock` on the device node (waiting up to 30 s), drains,
   does the work and closes. Never hold the device open between tool calls.
+- **Three tiers of tools, marked by MCP annotations** (tested in `test_mcp.py`), so users can allow
+  some without prompts and keep the rest behind approval:
+  - read-only: `identify`, `screenshot`, `get_settings`, `get_waveform`, `scpi_query`, `save_setup`
+  - changes that can be undone: `measure` (adds to the measurement bar) and the `configure_*` tools
+  - destructive: `run_control`, `clear_measurements`, `restore_setup`, `autoscale`, `reset`,
+    `scpi_write`
+- **Undo contract:** `configure_*` return `{requested, before, after}` per setting. Result keys are
+  the parameter names, and `_apply` reads *every* before-value before writing anything, because
+  changes interact (a new probe ratio rescales V/div). So passing the before-values back in one call
+  is a true undo. The exception is trigger `mode`: it's switched to EDGE implicitly, so undo drops it.
+  `restore_setup`, `autoscale`, `reset` and `scpi_write` save a setup backup first and return its
+  path.
 - **No PyVISA, pyusb or NI-VISA.** PyVISA's pure-Python USB path goes through libusb, which means
   detaching the kernel driver and a second udev rule, and it doesn't handle this scope's quirks. The
   `write`/`query`/`query_bytes` transport interface is VISA-like, so switching is cheap if more
   instruments arrive.
 - **MCP error handling:** only `ToolError` messages reach the model; any other exception shows up as
   "Error executing tool X". `_with_scope()` converts `ScopeError`/`OSError`/`ValueError`.
-- **Read-only boundary:** `check_read_only_query()` requires a single command whose header ends in `?`
-  (no `;`, and not `*TST?`). Channel and measurement names are validated before anything is sent.
-  Future state-changing tools must be separate tools with `read_only_hint=False`, so users can keep
-  them behind approval.
+- **Validation before sending:** every argument is checked and formatted in `scope.py` (`choice()`,
+  `number()`, `channel_name()`…), so nothing a model passes can inject SCPI. `check_read_only_query()`
+  and `check_command()` allow exactly one command each: no `;`, a query only when its header ends in
+  `?`, and never a query through `write`, because the unread reply would desync the stream.
 - Captures deliberately don't use `$XDG_DATA_HOME`: inside the VS Code snap it points at
   `~/snap/code/<rev>/…`, which vanishes on update.
 
 **Roadmap:**
-1. State-changing tools (channel, timebase, trigger, run/stop/single), with read-back and
-   `:SYSTem:ERRor?` checks.
+1. Verify `reset`/`autoscale`/`clear_measurements` on hardware. This needs the user's OK, because
+   they wipe the setup or the measurement bar.
 2. RAW (memory-depth) waveforms.
 3. Waveform plots.
 4. `TcpTransport` once a network cable is connected.
@@ -109,12 +125,15 @@ tests/           # unit tests on FakeRigol; test_hardware.py (marker `hardware`,
 uv manages everything; it's at `~/.local/bin/uv`. Python is the system 3.12, pinned in `.python-version`.
 
 ```bash
-uv sync                          # create/refresh .venv from uv.lock
-uv add <pkg> / uv add --dev <pkg>
-uv run pytest                    # unit tests, no scope needed (hardware tests deselected by default)
-uv run pytest -m hardware        # read-only tests against the real scope
-uv run rigol --help              # idn | screenshot | settings | measure | waveform | query
-claude mcp get rigol             # check the registered server; `claude mcp list` health-checks it
+uv sync                           # create/refresh .venv from uv.lock
+uv run pytest                     # unit tests, no scope needed (hardware tests deselected by default)
+uv run pytest -m hardware         # read-only tests against the real scope
+uv run pytest -m hardware_write   # changes settings and restores them (~15 s; the user sees it)
+RIGOL_ALLOW_RESET=1 uv run pytest -m hardware_write   # ...including *RST and autoscale
+uv run rigol --help               # read: idn screenshot settings measure waveform query save-setup
+                                  # change: channel timebase trigger acquisition run stop single force
+                                  #         clear-measurements restore-setup autoscale reset write
+claude mcp get rigol              # check the registered server; `claude mcp list` health-checks it
 ```
 
 After changing the MCP server, sessions pick up the new code only when their server restarts
@@ -123,55 +142,66 @@ After changing the MCP server, sessions pick up the new code only when their ser
 ## Conventions
 
 - Structured CLI output is JSON on stdout, in SI floats (V, s, Hz, Sa/s) with units in the key names.
-  `query` prints the raw reply. Errors go to stderr with exit code 1.
+  `query` prints the raw reply. Errors go to stderr with exit code 1. `reset` and `autoscale` require
+  `--yes`.
 - A measurement the scope can't make (`9.9E37`) becomes `null`, never a number.
-- For future set commands: read back after every set, because the scope snaps values to its
-  supported steps. Then check `:SYSTem:ERRor?`.
-- Every parsing and scaling path gets a unit test on `FakeRigol`. Hardware tests stay read-only.
+- Every change is read back and the error queue checked (`_apply`, `_command`). Report the scope's
+  "after", not what was requested.
+- Every parsing and scaling path gets a unit test on `FakeRigol`. Hardware tests either only read,
+  or restore everything they change and verify that they did.
 
 ## Rules for driving the live scope
 
 - **Never report a reading you didn't just get from the instrument.** Quote the returned values with
   units. If there's no live connection, say so.
-- **Reads are fine. Confirm before anything destructive:** `*RST`, `:AUToscale`, `:CLEar`, or
-  overwriting settings the user set up. Also confirm before `:RUN`/`:SINGle` while the scope is
-  `STOP`ped with a capture on screen, because it gets overwritten.
+- **The user may have set the scope up by hand.** Change only what they asked for. Confirm before
+  anything broader: reset, autoscale, clearing measurements, or channels they didn't mention. Also
+  confirm before `run`/`single` while the scope is stopped on a capture, because it gets
+  overwritten.
 - ✅ `measure` has a visible side effect: `:MEASure:ITEM?` adds the item to the on-screen measurement
   bar. The bar holds at most 5 items, so this can scroll off the user's own readouts.
 - **Physical actions are the user's:** probing, the probe's 1×/10× switch, compensation, cabling.
 - Voltages off by exactly 10× mean the channel's `:PROBe` ratio doesn't match the physical probe.
 
-## SCPI notes
+## Behaviour verified on this unit
 
-- ✅ Binary replies are TMC blocks: `#9<9-digit length><data>\n`.
-- **Don't flood it.** Send one command at a time. Separate writes followed by a query (as in
-  `waveform()`) are fine ✅.
+- ✅ **Snapping:** the scope snaps to its own steps. A requested 30 ns/div became 50 ns/div.
+  Trigger level and offset snap to fractions of a division.
+- ✅ **Status lag:** `:TRIGger:STATus?` lags run-control commands by ~100–150 ms, even after `*OPC?`.
+  `run`/`stop` poll until it changes. `single` first waits for the scope to arm, so a stale `STOP`
+  isn't mistaken for a capture.
+- ✅ **Single and run:** `:SINGle` sets the sweep to `SING`, and a following `:RUN` restores the
+  previous sweep mode.
+- ✅ **Setup snapshot:** `:SYSTem:SETup?` is a 2081-byte binary blob starting `VZ8\0DS1054Z`.
+  Writing it back with `:SYSTem:SETup #9…` (one 2 KB transfer) takes ~6 s and restores every
+  setting. The blob isn't byte-identical afterwards (it holds transient state), so compare
+  `settings()` instead.
 - ✅ **Waveforms:** `:WAVeform:SOURce/MODE NORMal/FORMat BYTE`, then `:PREamble?`
   (`format,type,points,count,xinc,xorigin,xref,yinc,yorigin,yref`) and `:DATA?` (1200 points).
   `V = (raw − yorigin − yref) × yinc` matched the scope's own VPP to within 2%.
   Raw 0 or 255 means clipped.
   - `RAW` mode (untested) needs `:STOP` first. Read it in chunks of ≤250 000 points via
     `:WAVeform:STARt`/`:STOP`, which are 1-based and inclusive.
-- ✅ **Screenshot:** `:DISPlay:DATA? ON,OFF,PNG` returns an 800×480 RGB PNG.
-- ✅ Every query in `DS1054Z.settings()` is valid on SP4: the error queue stays empty.
-  `:CHANnel<n>:DISPlay?` returns `1`/`0`.
+- ✅ **Screenshot:** `:DISPlay:DATA? ON,OFF,PNG` returns an 800×480 RGB PNG. Binary replies are TMC
+  blocks: `#9<9-digit length><data>\n`.
 
 ## SCPI quick reference
 
-Capitals mark the short form (`:TRIGger:STATus?` ≡ `:TRIG:STAT?`). ✅ = verified on this unit.
+Capitals mark the short form (`:TRIGger:STATus?` ≡ `:TRIG:STAT?`). ✅ = verified on this unit, for
+both the query and the set form unless noted.
 
 | Area | Commands |
 |---|---|
-| Identity / errors | `*IDN?` ✅, `*OPC?`, `*CLS`, `:SYSTem:ERRor?` ✅ |
-| Run control | `:RUN`, `:STOP`, `:SINGle`, `:TFORce`; `:TRIGger:STATus?` ✅ → `TD` / `WAIT` / `RUN` / `AUTO` / `STOP` |
-| Channel *n* | `:CHANnel<n>:DISPlay?` ✅, `:SCALe` ✅, `:OFFSet` ✅, `:COUPling` ✅, `:PROBe` ✅, `:BWLimit` ✅, `:INVert` ✅ (queries verified; setting forms not yet) |
-| Timebase | `:TIMebase:MODE?` ✅, `:TIMebase:MAIN:SCALe` ✅, `:TIMebase:MAIN:OFFSet` ✅ |
-| Trigger | `:TRIGger:MODE` ✅, `:SWEep` ✅, `:EDGe:SOURce` ✅, `:EDGe:SLOPe` ✅, `:EDGe:LEVel` ✅ |
-| Acquire | `:ACQuire:TYPE` ✅, `:AVERages` ✅, `:MDEPth?` ✅, `:SRATe?` ✅ |
-| Measure | `:MEASure:ITEM? <item>,CHAN<n>` ✅ (VPP, VAVG, VRMS, FREQ tried; the full item list is in `scope.py`) |
+| Identity / errors | `*IDN?` ✅, `*OPC?` ✅, `:SYSTem:ERRor?` ✅ |
+| Run control | `:RUN` ✅, `:STOP` ✅, `:SINGle` ✅, `:TFORce` ✅; `:TRIGger:STATus?` ✅ → `TD` / `WAIT` / `RUN` / `AUTO` / `STOP` |
+| Channel *n* | `:CHANnel<n>:DISPlay` ✅, `:PROBe` ✅, `:SCALe` ✅, `:OFFSet` ✅, `:COUPling` ✅, `:BWLimit` ✅, `:INVert` ✅, `:VERNier` ✅ |
+| Timebase | `:TIMebase:MAIN:SCALe` ✅, `:TIMebase:MAIN:OFFSet` ✅, `:TIMebase:MODE` (query ✅; XY/ROLL untested) |
+| Trigger | `:TRIGger:MODE` ✅, `:SWEep` ✅, `:COUPling` ✅, `:HOLDoff` ✅, `:EDGe:SOURce` ✅ (AC line untested), `:EDGe:SLOPe` ✅, `:EDGe:LEVel` ✅ |
+| Acquire | `:ACQuire:TYPE` ✅, `:AVERages` ✅, `:MDEPth` ✅, `:SRATe?` ✅ |
+| Measure | `:MEASure:ITEM? <item>,CHAN<n>` ✅ (VPP, VAVG, VRMS, FREQ tried; the full list is in `scope.py`); `:MEASure:CLEar ALL\|ITEM<n>` (untested) |
 | Waveform | `:WAVeform:SOURce` ✅, `:MODE` ✅, `:FORMat` ✅, `:PREamble?` ✅, `:DATA?` ✅, `:STARt`, `:STOP` |
-| Screen | `:DISPlay:DATA? ON,OFF,PNG` ✅ |
-| **Destructive** (confirm first) | `*RST`, `:AUToscale`, `:CLEar` |
+| Screen / setup | `:DISPlay:DATA? ON,OFF,PNG` ✅, `:SYSTem:SETup?` ✅, `:SYSTem:SETup <block>` ✅ |
+| **Destructive** | `*RST`, `:AUToscale` (untested: they wipe the user's setup), `:CLEar` |
 
 The authoritative source is the *MSO1000Z/DS1000Z Programming Guide*. Save the PDF under `docs/` and
 Read it with the `pages` parameter.

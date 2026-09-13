@@ -18,6 +18,17 @@ def test_command_frame_is_dev_dep_msg_out_padded_to_four_bytes():
     assert frame[12:] == b"*IDN?\n\0\0"
 
 
+def test_block_write_frames_data_as_ieee_block():
+    fake = FakeRigol()
+    written = []
+    fake.write = written.append
+    UsbtmcTransport(fake).write_block(":SYSTem:SETup", b"a\nb")
+    (frame,) = written
+    payload = b":SYSTem:SETup #9000000003a\nb\n"
+    assert struct.unpack_from("<I", frame, 4)[0] == len(payload)
+    assert frame[12 : 12 + len(payload)] == payload and len(frame) % 4 == 0
+
+
 def test_reply_longer_than_one_packet_is_not_truncated():
     # Plain read() on the kernel driver stops at 52 bytes here ("...00.04.04.S").
     t = UsbtmcTransport(FakeRigol({"*IDN?": IDN}))

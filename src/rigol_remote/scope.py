@@ -1,18 +1,25 @@
-"""The DS1054Z's SCPI, wrapped: identity, screenshots, settings, measurements and waveforms.
+"""The DS1054Z's SCPI, wrapped.
 
-Nothing here changes acquisition settings. Two side effects: measure() adds its items to the
-on-screen measurement bar, and waveform() sets the :WAVeform: readout parameters, which only affect
-what :WAVeform:DATA? returns.
+Reading: identify, screenshot, settings, measure, waveform, query. Reading never changes acquisition
+settings, with two side effects: measure() adds its items to the on-screen measurement bar, and
+waveform() sets the :WAVeform: readout parameters (they only affect what :WAVeform:DATA? returns).
+
+Control: configure_* change only the settings passed. Each change is read back and returned with
+its before value, so it can be undone, and the error queue is checked afterwards. save_setup() and
+restore_setup() snapshot and restore the whole setup.
 """
 
 from __future__ import annotations
 
 import math
 import re
+import time
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 INVALID_MEASUREMENT = 9.9e37  # what :MEASure:ITEM? returns when a value can't be measured
+SETUP_SIGNATURE = b"DS1054Z"  # appears in the first bytes of a :SYSTem:SETup? block
 
 # Single-source :MEASure:ITEM? items, long form with the short form in capitals, and their units.
 _MEASUREMENTS = {
@@ -23,11 +30,10 @@ _MEASUREMENTS = {
     "MARea": "V*s", "MPARea": "V*s", "PSLEWrate": "V/s", "NSLEWrate": "V/s", "VARIance": "V^2",
     "PPULses": "count", "NPULses": "count", "PEDGes": "count", "NEDGes": "count",
 }
-_ITEM_BY_NAME = {}
-for _long, _unit in _MEASUREMENTS.items():
-    _short = re.match(r"[A-Z]+", _long).group()
-    _ITEM_BY_NAME[_short] = _ITEM_BY_NAME[_long.upper()] = (_short, _unit)
-MEASUREMENT_ITEMS = sorted({short for short, _ in _ITEM_BY_NAME.values()})
+PROBE_RATIOS = (0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000)
+AVERAGES = tuple(2**n for n in range(1, 11))  # 2..1024
+MEMORY_DEPTHS = (3000, 6000, 12000, 30000, 60000, 120000, 300000, 600000,
+                 1200000, 3000000, 6000000, 12000000, 24000000)  # valid subset depends on channels on
 
 
 class ScopeError(Exception):
@@ -36,20 +42,35 @@ class ScopeError(Exception):
 
 class Transport(Protocol):
     def write(self, command: str) -> None: ...
+    def write_block(self, command: str, data: bytes) -> None: ...
     def query(self, command: str, timeout: float = ...) -> str: ...
     def query_bytes(self, command: str, timeout: float = ...) -> bytes: ...
 
 
-def parse_block(data: bytes) -> bytes:
-    """Payload of an IEEE 488.2 definite-length block: #<n><n-digit length><payload>[\\n]."""
-    if len(data) < 2 or data[:1] != b"#" or not b"1" <= data[1:2] <= b"9":
-        raise ValueError(f"not a definite-length block: {data[:12]!r}")
-    digits = int(data[1:2])
-    length = int(data[2 : 2 + digits])
-    payload = data[2 + digits : 2 + digits + length]
-    if len(payload) != length:
-        raise ValueError(f"block truncated: {len(payload)} of {length} bytes")
-    return payload
+# --- validation: every argument is checked and formatted here before anything is sent ---
+
+def _short(keyword: str) -> str:
+    return re.match(r"[A-Z0-9]+", keyword).group()
+
+
+def choice(value: str, keywords: Iterable[str], what: str, aliases: Mapping[str, str] | None = None) -> str:
+    """Match value against SCPI keywords (long form with the short form in capitals, e.g. 'NORMal')
+    or friendly aliases; return the short form. SCPI accepts only the short or the full long form."""
+    v = str(value).strip()
+    for keyword in keywords:
+        if v.upper() in (keyword.upper(), _short(keyword)):
+            return _short(keyword)
+    if aliases and v.lower() in aliases:
+        return aliases[v.lower()]
+    options = [_short(k) for k in keywords] + sorted(aliases or {})
+    raise ValueError(f"unknown {what} {value!r}; choose from {', '.join(options)}")
+
+
+def number(value: float, what: str) -> str:
+    v = float(value)
+    if not math.isfinite(v):
+        raise ValueError(f"{what} must be a finite number, not {value!r}")
+    return f"{v:.7g}"
 
 
 def channel_name(channel: str | int) -> str:
@@ -62,10 +83,25 @@ def channel_name(channel: str | int) -> str:
 
 def measurement_item(name: str) -> tuple[str, str]:
     """'freq' / 'FREQuency' → ('FREQ', 'Hz')."""
-    try:
-        return _ITEM_BY_NAME[name.strip().upper()]
-    except KeyError:
-        raise ValueError(f"unknown measurement {name!r}; choose from {', '.join(MEASUREMENT_ITEMS)}") from None
+    short = choice(name, _MEASUREMENTS, "measurement")
+    return short, _UNITS[short]
+
+
+_UNITS = {_short(k): unit for k, unit in _MEASUREMENTS.items()}
+MEASUREMENT_ITEMS = sorted(_UNITS)
+
+
+def _probe_ratio(value: float) -> str:
+    v = float(value)
+    if not any(math.isclose(v, r) for r in PROBE_RATIOS):
+        raise ValueError(f"probe ratio must be one of {', '.join(f'{r:g}' for r in PROBE_RATIOS)}")
+    return f"{v:g}"
+
+
+def _flag(value: bool) -> str:
+    if not isinstance(value, bool):
+        raise ValueError(f"expected true or false, not {value!r}")
+    return "1" if value else "0"
 
 
 def check_read_only_query(command: str) -> str:
@@ -79,6 +115,34 @@ def check_read_only_query(command: str) -> str:
     if header.upper() == "*TST?":
         raise ValueError("*TST? runs a self-test; not allowed as a read-only query")
     return command
+
+
+def check_command(command: str) -> str:
+    """Accept a single SCPI command that expects no reply."""
+    command = command.strip()
+    if not command or any(c in command for c in ";\r\n"):
+        raise ValueError("send exactly one SCPI command (no ';' or newlines)")
+    if "?" in command.split()[0]:
+        raise ValueError("that's a query: use the query tool (an unread reply would desync the scope)")
+    return command
+
+
+# --- read-back parsers ---
+
+def _is_on(reply: str) -> bool:
+    return reply in ("1", "ON")
+
+
+def _depth(reply: str) -> int | str:
+    return int(reply) if reply.isdigit() else reply
+
+
+@dataclass
+class _Change:
+    key: str  # the configure_* parameter name, so a result's before-values can be passed back to undo
+    header: str  # SCPI header; queried with '?' for the read-back
+    argument: str  # validated, formatted argument
+    parse: Callable[[str], Any]
 
 
 @dataclass
@@ -129,12 +193,26 @@ class Waveform:
         return "time_s,volts\n" + "".join(f"{t:.6e},{v:.6e}\n" for t, v in zip(self.times(), self.volts()))
 
 
+def parse_block(data: bytes) -> bytes:
+    """Payload of an IEEE 488.2 definite-length block: #<n><n-digit length><payload>[\\n]."""
+    if len(data) < 2 or data[:1] != b"#" or not b"1" <= data[1:2] <= b"9":
+        raise ValueError(f"not a definite-length block: {data[:12]!r}")
+    digits = int(data[1:2])
+    length = int(data[2 : 2 + digits])
+    payload = data[2 + digits : 2 + digits + length]
+    if len(payload) != length:
+        raise ValueError(f"block truncated: {len(payload)} of {length} bytes")
+    return payload
+
+
 class DS1054Z:
     def __init__(self, transport: Transport):
         self.transport = transport
 
     def _q(self, command: str) -> str:
         return self.transport.query(command)
+
+    # --- reading ---
 
     def identify(self) -> dict:
         manufacturer, model, serial, firmware = self._q("*IDN?").split(",")
@@ -161,18 +239,20 @@ class DS1054Z:
         for n in range(1, 5):
             c = f":CHANnel{n}"
             channels[f"CHAN{n}"] = {
-                "display": self._q(f"{c}:DISPlay?") == "1",
+                "display": _is_on(self._q(f"{c}:DISPlay?")),
                 "scale_v_per_div": float(self._q(f"{c}:SCALe?")),
                 "offset_v": float(self._q(f"{c}:OFFSet?")),
                 "coupling": self._q(f"{c}:COUPling?"),
                 "probe_ratio": float(self._q(f"{c}:PROBe?")),
                 "bw_limit": self._q(f"{c}:BWLimit?"),
-                "invert": self._q(f"{c}:INVert?") == "1",
+                "invert": _is_on(self._q(f"{c}:INVert?")),
             }
         trigger = {
             "mode": self._q(":TRIGger:MODE?"),
             "sweep": self._q(":TRIGger:SWEep?"),
             "status": self._q(":TRIGger:STATus?"),
+            "coupling": self._q(":TRIGger:COUPling?"),
+            "holdoff_s": float(self._q(":TRIGger:HOLDoff?")),
         }
         if trigger["mode"] == "EDGE":
             trigger |= {
@@ -180,7 +260,6 @@ class DS1054Z:
                 "slope": self._q(":TRIGger:EDGe:SLOPe?"),
                 "level_v": float(self._q(":TRIGger:EDGe:LEVel?")),
             }
-        depth = self._q(":ACQuire:MDEPth?")
         return {
             "channels": channels,
             "timebase": {
@@ -192,7 +271,7 @@ class DS1054Z:
             "acquire": {
                 "type": self._q(":ACQuire:TYPE?"),
                 "averages": int(self._q(":ACQuire:AVERages?")),
-                "memory_depth": int(depth) if depth.isdigit() else depth,
+                "memory_depth": _depth(self._q(":ACQuire:MDEPth?")),
                 "sample_rate_sa_per_s": float(self._q(":ACQuire:SRATe?")),
             },
         }
@@ -228,3 +307,206 @@ class DS1054Z:
             except ValueError:
                 pass
         return reply.decode("ascii", errors="replace").rstrip("\n")
+
+    # --- changing settings ---
+
+    def _apply(self, changes: list[_Change]) -> dict:
+        """Make the changes in order and check the error queue.
+
+        Every "before" is read before anything is written, and every "after" once all writes are
+        done: changes interact (a new probe ratio rescales V/div), so passing the before values
+        back in one call is a true undo.
+        """
+        if not changes:
+            raise ValueError("nothing to change: give at least one setting")
+        self.errors()  # start from an empty queue so any errors below are ours
+        before = {c.key: c.parse(self._q(f"{c.header}?")) for c in changes}
+        for c in changes:
+            self.transport.write(f"{c.header} {c.argument}")
+            self._q("*OPC?")  # one command at a time: don't let writes pile up in the scope's parser
+        results = {
+            c.key: {"requested": c.parse(c.argument), "before": before[c.key], "after": c.parse(self._q(f"{c.header}?"))}
+            for c in changes
+        }
+        if errors := self.errors():
+            raise ScopeError(f"the scope reported {errors}; values now: {results}")
+        return results
+
+    def configure_channel(
+        self,
+        channel: str | int,
+        *,
+        display: bool | None = None,
+        probe_ratio: float | None = None,
+        scale_v_per_div: float | None = None,
+        offset_v: float | None = None,
+        coupling: str | None = None,
+        bw_limit: str | None = None,
+        invert: bool | None = None,
+    ) -> dict:
+        ch = channel_name(channel)
+        c = f":CHANnel{ch[-1]}"
+        changes = []
+        if display is not None:
+            changes.append(_Change("display", f"{c}:DISPlay", _flag(display), _is_on))
+        # Probe ratio first: it rescales V/div. Scale before offset: the offset range depends on it.
+        if probe_ratio is not None:
+            changes.append(_Change("probe_ratio", f"{c}:PROBe", _probe_ratio(probe_ratio), float))
+        if scale_v_per_div is not None:
+            changes.append(_Change("scale_v_per_div", f"{c}:SCALe", number(scale_v_per_div, "scale"), float))
+        if offset_v is not None:
+            changes.append(_Change("offset_v", f"{c}:OFFSet", number(offset_v, "offset"), float))
+        if coupling is not None:
+            changes.append(_Change("coupling", f"{c}:COUPling", choice(coupling, ("AC", "DC", "GND"), "coupling"), str))
+        if bw_limit is not None:
+            changes.append(_Change("bw_limit", f"{c}:BWLimit", choice(bw_limit, ("20M", "OFF"), "bandwidth limit"), str))
+        if invert is not None:
+            changes.append(_Change("invert", f"{c}:INVert", _flag(invert), _is_on))
+        return {"channel": ch, "changes": self._apply(changes)}
+
+    def configure_timebase(
+        self, *, scale_s_per_div: float | None = None, offset_s: float | None = None, mode: str | None = None
+    ) -> dict:
+        changes = []
+        if mode is not None:
+            changes.append(_Change("mode", ":TIMebase:MODE", choice(mode, ("MAIN", "XY", "ROLL"), "timebase mode"), str))
+        if scale_s_per_div is not None:
+            changes.append(_Change("scale_s_per_div", ":TIMebase:MAIN:SCALe", number(scale_s_per_div, "scale"), float))
+        if offset_s is not None:
+            changes.append(_Change("offset_s", ":TIMebase:MAIN:OFFSet", number(offset_s, "offset"), float))
+        return {"changes": self._apply(changes)}
+
+    def configure_trigger(
+        self,
+        *,
+        sweep: str | None = None,
+        source: str | None = None,
+        slope: str | None = None,
+        level_v: float | None = None,
+        coupling: str | None = None,
+        holdoff_s: float | None = None,
+    ) -> dict:
+        """Edge trigger settings; giving source, slope or level switches the trigger to EDGE mode."""
+        changes = []
+        if source is not None or slope is not None or level_v is not None:
+            changes.append(_Change("mode", ":TRIGger:MODE", "EDGE", str))
+        if source is not None:
+            src = "AC" if str(source).strip().upper() in ("AC", "LINE") else channel_name(source)
+            changes.append(_Change("source", ":TRIGger:EDGe:SOURce", src, str))
+        if slope is not None:
+            s = choice(slope, ("POSitive", "NEGative", "RFALl"), "slope",
+                       {"rising": "POS", "falling": "NEG", "either": "RFAL"})
+            changes.append(_Change("slope", ":TRIGger:EDGe:SLOPe", s, str))
+        if coupling is not None:
+            cp = choice(coupling, ("AC", "DC", "LFReject", "HFReject"), "trigger coupling")
+            changes.append(_Change("coupling", ":TRIGger:COUPling", cp, str))
+        if holdoff_s is not None:
+            changes.append(_Change("holdoff_s", ":TRIGger:HOLDoff", number(holdoff_s, "holdoff"), float))
+        if level_v is not None:  # after the source: the level's range depends on its scale and offset
+            changes.append(_Change("level_v", ":TRIGger:EDGe:LEVel", number(level_v, "level"), float))
+        if sweep is not None:
+            changes.append(_Change("sweep", ":TRIGger:SWEep", choice(sweep, ("AUTO", "NORMal", "SINGle"), "sweep"), str))
+        return {"changes": self._apply(changes)}
+
+    def configure_acquisition(
+        self, *, acquisition_type: str | None = None, averages: int | None = None, memory_depth: int | str | None = None
+    ) -> dict:
+        changes = []
+        if acquisition_type is not None:
+            t = choice(acquisition_type, ("NORMal", "AVERages", "PEAK", "HRESolution"), "acquisition type",
+                       {"average": "AVER", "high_resolution": "HRES"})
+            changes.append(_Change("acquisition_type", ":ACQuire:TYPE", t, str))
+        if averages is not None:
+            if averages not in AVERAGES:
+                raise ValueError(f"averages must be a power of two from 2 to 1024, not {averages!r}")
+            changes.append(_Change("averages", ":ACQuire:AVERages", str(int(averages)), int))
+        if memory_depth is not None:
+            if str(memory_depth).strip().upper() == "AUTO":
+                depth = "AUTO"
+            elif memory_depth in MEMORY_DEPTHS:
+                depth = str(int(memory_depth))
+            else:
+                raise ValueError(f"memory depth must be AUTO or one of {', '.join(map(str, MEMORY_DEPTHS))}")
+            changes.append(_Change("memory_depth", ":ACQuire:MDEPth", depth, _depth))
+        return {"changes": self._apply(changes)}
+
+    # --- run control ---
+
+    def _run_state(self) -> dict:
+        self._q("*OPC?")  # let the preceding command take effect first
+        return {"status": self._q(":TRIGger:STATus?"), "sweep": self._q(":TRIGger:SWEep?")}
+
+    def _wait_for_status(self, done: Callable[[str], bool], timeout: float) -> dict:
+        # :TRIGger:STATus? lags run-control commands by ~100-150 ms, even after *OPC?.
+        deadline = time.monotonic() + timeout
+        state = self._run_state()
+        while not done(state["status"]) and time.monotonic() < deadline:
+            time.sleep(0.05)
+            state = self._run_state()
+        return state
+
+    def run(self) -> dict:
+        self.transport.write(":RUN")  # after a single, this also restores the previous sweep mode
+        return self._wait_for_status(lambda s: s != "STOP", 2.0)
+
+    def stop(self) -> dict:
+        self.transport.write(":STOP")
+        return self._wait_for_status(lambda s: s == "STOP", 2.0)
+
+    def force_trigger(self) -> dict:
+        self.transport.write(":TFORce")
+        return self._run_state()
+
+    def single(self, wait_s: float = 0.0) -> dict:
+        """Arm a single acquisition; optionally wait up to wait_s for it to complete (status STOP)."""
+        self.transport.write(":SINGle")
+        # Wait for it to arm first, so a stale STOP from before isn't mistaken for a capture. A
+        # capture that completes within the lag goes straight to STOP, which ends this wait too.
+        state = self._wait_for_status(lambda s: s != "STOP", 0.5)
+        if wait_s > 0:
+            state = self._wait_for_status(lambda s: s == "STOP", wait_s)
+        return state | {"captured": state["status"] == "STOP"}
+
+    # --- whole-setup and screen-wide operations ---
+
+    def _command(self, command: str, timeout: float = 10.0) -> None:
+        """Send a command, wait until the scope has processed it, and check the error queue."""
+        self.errors()
+        self.transport.write(command)
+        self.transport.query("*OPC?", timeout=timeout)
+        if errors := self.errors():
+            raise ScopeError(f"{command}: the scope reported {errors}")
+
+    def clear_measurements(self, item: int | None = None) -> dict:
+        """Remove one item (1-5) or all items from the on-screen measurement bar."""
+        if item is not None and item not in range(1, 6):
+            raise ValueError("measurement item must be 1-5 (or omitted for all)")
+        target = "ALL" if item is None else f"ITEM{item}"
+        self._command(f":MEASure:CLEar {target}")
+        return {"cleared": target}
+
+    def save_setup(self) -> bytes:
+        """The whole setup as the scope's own binary blob (restore it with restore_setup)."""
+        return parse_block(self.transport.query_bytes(":SYSTem:SETup?", timeout=5))
+
+    def restore_setup(self, data: bytes) -> dict:
+        if SETUP_SIGNATURE not in data[:16]:
+            raise ValueError("that is not a DS1054Z setup saved by save_setup")
+        self.errors()
+        self.transport.write_block(":SYSTem:SETup", data)
+        self.transport.query("*OPC?", timeout=30)  # applying a setup takes the scope ~6 s
+        if errors := self.errors():
+            raise ScopeError(f"restoring the setup: the scope reported {errors}")
+        return self.settings()
+
+    def autoscale(self) -> dict:
+        self._command(":AUToscale", timeout=30)
+        return self.settings()
+
+    def reset(self) -> dict:
+        self._command("*RST", timeout=30)
+        return self.settings()
+
+    def write(self, command: str) -> None:
+        """Escape hatch: one SCPI command that expects no reply; raises if the scope reports an error."""
+        self._command(check_command(command))

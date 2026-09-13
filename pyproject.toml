@@ -26,5 +26,8 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-m 'not hardware'"
-markers = ["hardware: talks to the real scope (run with: uv run pytest -m hardware)"]
+addopts = "-m 'not hardware and not hardware_write'"
+markers = [
+    "hardware: reads from the real scope (run with: uv run pytest -m hardware)",
+    "hardware_write: changes the real scope's settings, then restores them (uv run pytest -m hardware_write)",
+]
